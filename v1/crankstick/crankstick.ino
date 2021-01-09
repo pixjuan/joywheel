@@ -1,10 +1,9 @@
 #include <Keyboard.h>
 #include <EEPROM.h>
 
-/* 
+/*
  * To compile this file you need Arduino 1.8.1 or later
- * in the 'tools' menu, select "Teensy 3.2/3.1" for board
- * and "Keyboard + mouse + joystick" for USB type
+ * in the 'tools' menu, select "Teensy 3.2/3.1" and "USB type Keyboard + mouse + joystick"
  */
 
 
@@ -22,12 +21,13 @@
 /* === Settings === */
 #define RESOLUTION (3 * resMultiplyer)
 #define POLL_FREQ 1
-#define KEYPRESS_LENGTH 5
-#define NB_MAPS 3 // number of different key mappings
-#define NB_BUTTONS 3
+#define KEYPRESS_LENGTH 50
+#define NB_MAPS 4 // number of different key mappings
+#define NB_BUTTONS 4
 #define DEFAULT_MAP_SETTING 0
 #define DEFAULT_RES_SETTING 1
 #define DEFAULT_KEYLEN_SETTING 2
+#define SERIAL_DBG Serial3
 
 // indexes for each setting value
 enum SETTING_LIST
@@ -37,6 +37,33 @@ enum SETTING_LIST
     SETTING_KEYLEN = 0x02,
     SETTING_MAP = 0x04,
 };
+
+enum HidType {
+    HID_KEYBOARD,
+    HID_JOYSTICK,
+    HID_NONE
+};
+
+typedef enum {
+    BUTTON,
+    X_AXIS,
+    Y_AXIS,
+    Z_AXIS,
+    NA_EVENT
+} JoyEvent;
+
+typedef struct _HidEvent{
+    HidType type;
+    JoyEvent event;
+    uint16_t value;
+} HidEvent;
+
+typedef struct _KeyMap{
+    HidEvent left;
+    HidEvent right;
+    HidEvent buttons[NB_BUTTONS];
+} KeyMap;
+
 
 
 /* === Pins definition === */
@@ -50,45 +77,80 @@ enum SETTING_LIST
 #define BUTTON_A_PIN 14
 #define BUTTON_B_PIN 15
 #define BUTTON_C_PIN 16
+#define PEDAL_PIN    20
 
 #define LIGHT_A_PIN 0
 #define LIGHT_B_PIN 1
 #define LIGHT_C_PIN 2
 
-#define SWITCH1_PIN 17 
+#define SWITCH1_PIN 17
 #define SWITCH2_PIN 18
 #define SWITCH3_PIN 19
 
+#define POT1_PIN 9
+#define POT2_PIN 8
 
 /* === Globals === */
-// all the settings are stored here
-int settingArray[8] = {0, 0, 0, 0, 0 ,0 ,0 ,0};
 
-uint16_t keymapLeft[NB_MAPS] = {'d', 'o', KEY_LEFT };
-uint16_t keymapRight[NB_MAPS] = {'f', 'p', KEY_RIGHT };
-uint16_t keymapButton[NB_BUTTONS][NB_MAPS] = {{'y', 'a', KEY_ESC},
-                                              {'n', 'b', ' '},
-                                              {'a', 'c', KEY_ENTER}};
+const HidEvent NO_KEY = { HID_NONE, NA_EVENT, 0};
+
+const KeyMap maps[NB_MAPS] = {
+    { //Sabotage map
+        .left = {HID_KEYBOARD, NA_EVENT, 'd'},
+        .right = {HID_KEYBOARD, NA_EVENT, 'f'},
+        .buttons= {{HID_KEYBOARD, NA_EVENT,'y'},
+                   {HID_KEYBOARD, NA_EVENT,'n'},
+                   {HID_KEYBOARD, NA_EVENT,'a'},
+                   {HID_KEYBOARD, NA_EVENT,'z'}},
+    },
+    { //SuperStardust map
+        .left = {HID_JOYSTICK, X_AXIS, 0},
+        .right = {HID_JOYSTICK, X_AXIS, 1023},
+        .buttons= {{HID_JOYSTICK, BUTTON, 1},
+                   {HID_JOYSTICK, Y_AXIS, 0},
+                   {HID_JOYSTICK, Y_AXIS, 1023},
+                   {HID_JOYSTICK, Y_AXIS, 0}},
+    },
+    { // generic keyboard map #1
+        .left = {HID_KEYBOARD, NA_EVENT, KEY_LEFT},
+        .right = {HID_KEYBOARD, NA_EVENT, KEY_RIGHT},
+        .buttons= {{HID_KEYBOARD, NA_EVENT, KEY_UP},
+                   {HID_KEYBOARD, NA_EVENT, KEY_DOWN},
+                   {HID_KEYBOARD, NA_EVENT, KEY_ENTER},
+                   {HID_KEYBOARD, NA_EVENT, KEY_SPACE}},
+    },
+    { // generic keyboard map #2
+        .left = {HID_KEYBOARD, NA_EVENT, KEY_UP},
+        .right = {HID_KEYBOARD, NA_EVENT, KEY_DOWN},
+        .buttons= {{HID_KEYBOARD, NA_EVENT, KEY_LEFT},
+                   {HID_KEYBOARD, NA_EVENT, KEY_RIGHT},
+                   {HID_KEYBOARD, NA_EVENT, KEY_ENTER},
+                   {HID_KEYBOARD, NA_EVENT, KEY_SPACE}},
+    }
+};
+
 unsigned char currentMap = 0;
 int previousSwitches = 0;
 
-char buttonPins[NB_BUTTONS] = {BUTTON_A_PIN, BUTTON_B_PIN, BUTTON_C_PIN};
+char buttonPins[NB_BUTTONS] = {BUTTON_A_PIN, BUTTON_B_PIN, BUTTON_C_PIN, PEDAL_PIN};
 
 int encoder0Pos = 0;
 
-// resolution multiplayer for the encoder (switch-controlled)
-int resMultiplyer = 1;
-// multiply the length of a key press (switch-controlled)
-int keyLengthMultiplyer = 2;
+// resolution multiplayer for the encoder (potentiometer-controlled)
+int resMultiplyer = 2;
+// multiply the length of a key press (potentiometer-controlled)
+int keyLengthMultiplyer = 4;
 
 // the last "rotational" pressed key
-uint16_t keyCode;
+HidEvent keyCode;
 // used to record the duration of the current "rotary" key press
 int keyJustPressed;
 // target duration, key will be released after that
 int keyPressDuration;
 // we have a separate variable for each button
 int buttonJustPressed[NB_BUTTONS] = {0, 0, 0};
+
+int lastWheelEvent;
 
 // mapping between button pins and led pins
 int buttonLed(int index)
@@ -101,7 +163,7 @@ int buttonLed(int index)
     case BUTTON_C_PIN:
         return LIGHT_C_PIN;
     default:
-        Serial3.print("Unknown button ");Serial3.println("index");
+        SERIAL_DBG.print("Unknown button ");SERIAL_DBG.println("index");
         // in case of error, we switch the default led
         return ledDoNotUse;
     };
@@ -144,7 +206,7 @@ char mouse_write(char data, char ack)
     for (i=0; i < 8; i++) {
         if (data & 0x01) {
             gohi(MDATA);
-        } 
+        }
         else {
             golo(MDATA);
         }
@@ -155,11 +217,11 @@ char mouse_write(char data, char ack)
             ;
         parity = parity ^ (data & 0x01);
         data = data >> 1;
-    }  
+    }
     /* parity */
     if (parity) {
         gohi(MDATA);
-    } 
+    }
     else {
         golo(MDATA);
     }
@@ -178,7 +240,7 @@ char mouse_write(char data, char ack)
     /* put a hold on the incoming data. */
     golo(MCLK);
     //  Serial.print("done.\n");
-  
+
     return ack?mouse_read():0;
 }
 
@@ -258,6 +320,81 @@ void mouse_init()
 
 /* === Internal functions === */
 
+
+void sendHidEvent(HidEvent event)
+{
+#ifdef DEBUG_MODE
+    return;
+#endif
+    switch(event.type) {
+    case HID_KEYBOARD:
+        usb_keyboard_press_keycode(event.value);
+        break;
+    case HID_JOYSTICK:
+    {
+        switch(event.event) {
+        case X_AXIS:
+            SERIAL_DBG.printf("X AXIS %d\r\n",event.value);
+            Joystick.X(event.value);
+            break;
+        case Y_AXIS:
+            Joystick.Y(event.value);
+            break;
+        case Z_AXIS:
+            Joystick.Z(event.value);
+            break;
+        case BUTTON:
+            SERIAL_DBG.println("BUTTON");
+            if (event.value <= 32)
+                Joystick.button(event.value, 1);
+            break;
+        default: //unsupported case
+            SERIAL_DBG.printf("unsupported event.event %d\r\n", event.event);
+        };
+        break;
+    }
+    default: //unsupported case
+        SERIAL_DBG.printf("unsupported event.type %d\r\n",event.type);
+    };
+}
+
+void releaseHidEvent(HidEvent event)
+{
+    switch(event.type) {
+    case HID_KEYBOARD:
+        usb_keyboard_release_keycode(event.value);
+        break;
+    case HID_JOYSTICK:
+    {
+        switch(event.event) {
+        case X_AXIS:
+            SERIAL_DBG.println("X AXIS CENTER");
+            Joystick.X(512);
+            break;
+        case Y_AXIS:
+            Joystick.Y(512);
+            break;
+        case Z_AXIS:
+            Joystick.Z(512);
+            break;
+        case BUTTON:
+            SERIAL_DBG.println("BUTTON RELEASE");
+            if (event.value <= 32)
+                Joystick.button(event.value, 0);
+            break;
+        default:
+            //unsupported case
+            SERIAL_DBG.println("unsupported event.event");
+        }
+        break;
+    };
+    default:
+        // unsupported case
+        SERIAL_DBG.println("unsupported event.type");
+    };
+}
+
+
 void processPS2Mouse()
 {
     char mz;
@@ -274,31 +411,35 @@ void processPS2Mouse()
         encoder0Pos += (int)mz;
     if ((int)mz >= 128 && (int)mz < 256)
         encoder0Pos -= (256 - (int)mz);
-      
+
     if (encoder0Pos <= -RESOLUTION) {
         encoder0Pos += RESOLUTION;
         // should we test for keyJustPressed in the condition?
         // Here we reset it and make a longer keypress
         keyJustPressed = 1;
-        keyCode = keymapLeft[currentMap];
-        usb_keyboard_press_keycode(keyCode);
+        keyCode = maps[currentMap].left;
+        lastWheelEvent = millis();
+        sendHidEvent(keyCode);
     }
     if (encoder0Pos >= RESOLUTION) {
         encoder0Pos -= RESOLUTION;
         keyJustPressed = 1;
-        keyCode = keymapRight[currentMap];
-        usb_keyboard_press_keycode(keyCode);
+        keyCode = maps[currentMap].right;
+        lastWheelEvent = millis();
+        sendHidEvent(keyCode);
     }
 
-    delay(20);  /* twiddle */
-    if (keyJustPressed == 1){
-        usb_keyboard_release_keycode(keyCode);
+    //delay(20);  /* twiddle */
+    int current = millis();
+    if (keyJustPressed == 1 && ((current - lastWheelEvent) > keyPressDuration )){
+        releaseHidEvent(keyCode);
+        keyJustPressed = 0;
     }
 }
 
 /* read all 3 switches  return (a + b * 2 + c * 4) */
 int readSwitchesVal()
-{ 
+{
     return (digitalRead(SWITCH1_PIN) +
             digitalRead(SWITCH2_PIN) * 2 +
             digitalRead(SWITCH3_PIN) * 4);
@@ -311,53 +452,12 @@ void setButtonsLights(int value)
     digitalWrite(LIGHT_C_PIN, (value&4)?HIGH:LOW);
 }
 
-/* 
- * For a given setting value:
- * - switch the lights accordingly
- * - read the buttons,
- * - return the new value 
- * The startvalue parameter is needed so that the function can switch the lights properly
- */
-int updateSettingVal(int startValue)
-{
-    int newValue;
-    setButtonsLights(startValue);
-  
-    newValue = startValue;
-    for (int btn = 0 ; btn < NB_BUTTONS ; btn++) {
-        // when the user releases the button, we clear the buttonJustPressed value
-        // so the button can be pressed again
-        if (digitalRead(buttonPins[btn]) == BUTTON_RELEASED && buttonJustPressed[btn]) {
-            buttonJustPressed[btn] = 0;
-            Serial3.print("Clearing Button pressed ");Serial3.println(btn);
-        }
-    
-        if (digitalRead(buttonPins[btn]) == BUTTON_PRESSED && buttonJustPressed[btn] == 0) {
-            buttonJustPressed[btn] = 1;
-      
-            // we xor the setting value with the current button value
-            if (newValue & (1<<btn)) {
-                digitalWrite(buttonLed(buttonPins[btn]), LOW);
-                Serial3.println("OFF");
-            }
-            else {
-                digitalWrite(buttonLed(buttonPins[btn]), HIGH);
-                Serial3.println("ON");
-            }
-            newValue = newValue^(1<<btn);
-            Serial3.print("setting Button pressed ");Serial3.println(btn);
-            Serial3.print("updated setting value ");Serial3.println(newValue);
-        }
-    }
-
-    return newValue;
-}
-
 void setup() {
-    pinMode (BUTTON_A_PIN, INPUT);
-    pinMode (BUTTON_B_PIN, INPUT);
-    pinMode (BUTTON_C_PIN, INPUT);
-  
+    pinMode (BUTTON_A_PIN, INPUT_PULLUP);
+    pinMode (BUTTON_B_PIN, INPUT_PULLUP);
+    pinMode (BUTTON_C_PIN, INPUT_PULLUP);
+    pinMode (PEDAL_PIN, INPUT_PULLUP);
+
     pinMode (SWITCH1_PIN, INPUT);
     pinMode (SWITCH2_PIN, INPUT);
     pinMode (SWITCH3_PIN, INPUT);
@@ -370,120 +470,63 @@ void setup() {
     digitalWrite(LIGHT_B_PIN, LOW);
     digitalWrite(LIGHT_C_PIN, LOW);
 
-#ifdef ENABLE_SERIAL3
-    Serial3.begin(115200);        //  TX:7  RX:8
-    Serial3.println("----------\n|SERIAL 3|\n----------");
-#endif
-
-    // one time init, enable the first time you run the code on a board
-    // for(int i = 0 ; i < 8 ; i++) {EEPROM.put(EEPROM_BASE_ADDRESS + i * sizeof(int), i);}
-  
-    // init the setting array with default values
-#ifdef USE_EEPROM
-    int val;
-    Serial3.println("EEPROM");
-    for(int i = 0 ; i < 8 ; i++) {
-        EEPROM.get( EEPROM_BASE_ADDRESS + i * sizeof(int), val );
-        settingArray[i] = val&0x7;
-        Serial3.println(val);
-    }
-#else
-    settingArray[SETTING_RES] = DEFAULT_RES_SETTING;
-    settingArray[SETTING_KEYLEN] = DEFAULT_KEYLEN_SETTING;
-    settingArray[SETTING_MAP] = DEFAULT_MAP_SETTING;
-#endif
+    pinMode (POT1_PIN, INPUT);
+    pinMode (POT2_PIN, INPUT);
 
 #ifdef ENABLE_SERIAL3
-    Serial3.println("SETTING ARRAY");
-    Serial3.println(settingArray[SETTING_RES]);
-    Serial3.println(settingArray[SETTING_KEYLEN]);
-    Serial3.println(settingArray[SETTING_MAP]);
+    SERIAL_DBG.begin(115200);        //  TX:7  RX:8
+    SERIAL_DBG.println("----------\n|SERIAL 3|\n----------");
 #endif
 
-  
     // PS2 mouse init
     mouse_init();
 #ifdef ENABLE_SERIAL3
-    Serial3.println("mouse_init done");
+    SERIAL_DBG.println("mouse_init done");
 #endif
 
     Keyboard.begin();
     keyJustPressed = 0;
-    keyCode = 0;
+    keyCode = NO_KEY;
+    lastWheelEvent = millis();
 }
 
 void loop() {
     processPS2Mouse();
 
     /* those values are read in the main loop because they can change at any time */
-    currentMap = min(settingArray[SETTING_MAP], NB_MAPS - 1);
-#ifdef ENABLE_SERIAL3
-    if (currentMap != settingArray[SETTING_MAP])
-        Serial3.println("invalid map number was fixed");
-#endif
+    int tempSwitches = readSwitchesVal();
 
-    resMultiplyer = settingArray[SETTING_RES];
-    keyLengthMultiplyer = settingArray[SETTING_KEYLEN];
+    tempSwitches = min(tempSwitches, NB_MAPS);
+    if (currentMap != tempSwitches) {
+        currentMap = tempSwitches;
+        SERIAL_DBG.printf("new switches val = %d\r\n", currentMap);
+    }
+
+    int val = 1 + (analogRead(POT1_PIN) >> 6);
+    if ( val != resMultiplyer ) {
+        resMultiplyer = val;
+        SERIAL_DBG.printf("resMultiplyer = %d\r\n", resMultiplyer);
+    }
+    val = 1 + (analogRead(POT2_PIN) >> 6);
+    if ( val != keyLengthMultiplyer ) {
+        keyLengthMultiplyer = val;
+        SERIAL_DBG.printf("keyLengthMultiplyer = %d\r\n", keyLengthMultiplyer);
+    }
     keyPressDuration = KEYPRESS_LENGTH * keyLengthMultiplyer;
 
-    int mySwitches = readSwitchesVal();
-    if (previousSwitches != mySwitches) {
-        Serial3.print("mySwitches : ");Serial3.print(mySwitches);Serial3.println();
-        if (mySwitches != SETTING_NONE) {
-            Serial3.println("SETTING mode ON");
-            // we release all the buttons in case the user was pressing one
-            for (int btn = 0 ; btn < NB_BUTTONS ; btn++) {
-                buttonJustPressed[btn] = 0;
-                usb_keyboard_release_keycode(keymapButton[btn][currentMap]);
-            }
-        } else {
-            // we release all the buttons and switch everything off
-            for (int btn = 0 ; btn < NB_BUTTONS ; btn++) {
-                buttonJustPressed[btn] = 0;
-                digitalWrite(buttonLed(buttonPins[btn]), LOW);
-            }
+    for (int btn = 0 ; btn < NB_BUTTONS ; btn++) {
+        // we release the key when the user releases the button
+        if (digitalRead(buttonPins[btn]) == BUTTON_RELEASED && buttonJustPressed[btn] == 1) {
+            buttonJustPressed[btn] = 0;
+            digitalWrite(buttonLed(buttonPins[btn]), LOW);
+            releaseHidEvent(maps[currentMap].buttons[btn]);
         }
 
-#ifdef USE_EEPROM
-        // and we write the value of the previous setting to the EEPROM
-        if(previousSwitches != SETTING_NONE) {
-            Serial3.println("updating EEPROM settings");
-            Serial3.println(previousSwitches);
-            Serial3.println(settingArray[previousSwitches]);
-            EEPROM.put( EEPROM_BASE_ADDRESS + previousSwitches * sizeof(int),
-                        settingArray[previousSwitches]);
+        if (digitalRead(buttonPins[btn]) == BUTTON_PRESSED && buttonJustPressed[btn] == 0) {
+            buttonJustPressed[btn] = 1;
+            digitalWrite(buttonLed(buttonPins[btn]), HIGH);
+            sendHidEvent(maps[currentMap].buttons[btn]);
         }
-#endif
-        previousSwitches = mySwitches;
     }
 
-    if (mySwitches != SETTING_NONE) { // settings mode that inhibits key presses
-        int currentSettingValue = 0;
-        int settingIndex = 0;
-            
-        // we read the switches position to know which setting we alter
-        settingIndex = readSwitchesVal(); // TODO get rid of this because we already have mySwitches?
-        currentSettingValue = updateSettingVal(settingArray[settingIndex]);
-        if (currentSettingValue != settingArray[settingIndex]) {
-            settingArray[settingIndex] = currentSettingValue;
-            Serial3.print("updating global setting variable ");Serial3.print(settingIndex);
-            Serial3.print(" with value ");Serial3.println(currentSettingValue);
-        }
-    }
-    else { // normal keyboard mode
-        for (int btn = 0 ; btn < NB_BUTTONS ; btn++) {
-            // we release the key when the user releases the button
-            if (digitalRead(buttonPins[btn]) == BUTTON_RELEASED && buttonJustPressed[btn] == 1) {
-                buttonJustPressed[btn] = 0;
-                digitalWrite(buttonLed(buttonPins[btn]), LOW);
-                usb_keyboard_release_keycode(keymapButton[btn][currentMap]);
-            }
-
-            if (digitalRead(buttonPins[btn]) == BUTTON_PRESSED && buttonJustPressed[btn] == 0) {
-                buttonJustPressed[btn] = 1;
-                digitalWrite(buttonLed(buttonPins[btn]), HIGH);
-                usb_keyboard_press_keycode(keymapButton[btn][currentMap]);
-            }
-        }
-    }
 }
